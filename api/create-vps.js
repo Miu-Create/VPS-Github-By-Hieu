@@ -1,6 +1,7 @@
 import { Octokit } from '@octokit/rest';
 import fs from 'fs';
 import sodium from 'libsodium-wrappers';
+
 const ALLOWED_ORIGIN_PATTERN = /^https?:\/\/([\w\-]+\.)?(hieuvn\.xyz|vps-github\.vercel\.app)(\/.)?$/;
 const VPS_USER_FILE = '/tmp/vpsuser.json';
 
@@ -52,7 +53,6 @@ async function createRepoSecret(octokit, owner, repo, secretName, secretValue) {
 // Helper function to create or update file safely
 async function createOrUpdateFile(octokit, owner, repo, path, content, message) {
   try {
-    // Try to get existing file first
     let sha = null;
     try {
       const { data: existingFile } = await octokit.rest.repos.getContent({
@@ -62,12 +62,10 @@ async function createOrUpdateFile(octokit, owner, repo, path, content, message) 
       });
       sha = existingFile.sha;
     } catch (error) {
-      // File doesn't exist, that's fine
       if (error.status !== 404) {
         throw error;
       }
     }
-    // Create or update the file
     const params = {
       owner,
       repo,
@@ -86,7 +84,7 @@ async function createOrUpdateFile(octokit, owner, repo, path, content, message) 
   }
 }
 
-// Generate tmate.yml workflow content
+// Generate tmate.yml workflow content with githubpass
 function generateTmateYml(ngrokServerUrl, vpsName, repoFullName) {
   return `name: Create VPS (Auto Restart)
 
@@ -129,8 +127,8 @@ jobs:
           Invoke-WebRequest -Uri "https://www.tightvnc.com/download/2.8.63/tightvnc-2.8.63-gpl-setup-64bit.msi" -OutFile "tightvnc-setup.msi" -TimeoutSec 60
           Write-Host "✅ TightVNC downloaded"
           
-          Start-Process msiexec.exe -Wait -ArgumentList '/i tightvnc-setup.msi /quiet /norestart ADDLOCAL="Server" SERVER_REGISTER_AS_SERVICE=1 SERVER_ADD_FIREWALL_EXCEPTION=1 SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=hieudz SET_ACCEPTHTTPCONNECTIONS=1 VALUE_OF_ACCEPTHTTPCONNECTIONS=1 SET_ALLOWLOOPBACK=1 VALUE_OF_ALLOWLOOPBACK=1'
-          Write-Host "✅ TightVNC installed"
+          Start-Process msiexec.exe -Wait -ArgumentList '/i tightvnc-setup.msi /quiet /norestart ADDLOCAL="Server" SERVER_REGISTER_AS_SERVICE=1 SERVER_ADD_FIREWALL_EXCEPTION=1 SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=githubpass SET_ACCEPTHTTPCONNECTIONS=1 VALUE_OF_ACCEPTHTTPCONNECTIONS=1 SET_ALLOWLOOPBACK=1 VALUE_OF_ALLOWLOOPBACK=1'
+          Write-Host "✅ TightVNC installed with password: githubpass"
           
           Write-Host "🔧 Enabling loopback connections in TightVNC registry..."
           Set-ItemProperty -Path "HKLM:\\SOFTWARE\\TightVNC\\Server" -Name "AllowLoopback" -Value 1 -ErrorAction SilentlyContinue
@@ -412,6 +410,7 @@ jobs:
           if ($cloudflaredUrl) {
             $remoteLink = "$cloudflaredUrl/vnc.html"
             Write-Host "🌌 Remote VNC URL: $remoteLink"
+            Write-Host "🔑 VNC Password: githubpass"
             
             $remoteLink | Out-File -FilePath "remote-link.txt" -Encoding UTF8 -NoNewline
             
@@ -454,7 +453,7 @@ jobs:
         }
         
         Write-Host "🚀 VPS Session Started - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        Write-Host "🌌 Access noVNC via remote-link.txt URL (Password: hieudz)"
+        Write-Host "🌌 Access noVNC via remote-link.txt URL (Password: githubpass)"
         
         mkdir -Force ".backup"
         
@@ -530,186 +529,3 @@ jobs:
           
           Invoke-RestMethod -Uri "https://api.github.com/repos/${repoFullName}/dispatches" -Method Post -Headers $headers -Body $payload -TimeoutSec 30
           Write-Host "✅ Workflow restart triggered"
-          
-          git add $lockFile
-          git commit -m "🔄 Auto restart - $currentTime" --allow-empty
-          git push origin main --force-with-lease
-          
-        } catch {
-          Write-Host "❌ Restart failed: $_"
-          Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
-          exit 1
-        }
-`;
-}
-
-// Generate auto-start.yml content
-function generateAutoStartYml(repoFullName) {
-  return `name: Auto Start VPS on Push
-
-on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - 'restart.lock'
-      - '.backup/**'
-      - 'links/**'
-
-jobs:
-  dispatch:
-    runs-on: ubuntu-latest
-    steps:
-      - name: 🚀 Trigger VPS Creation
-        run: |
-          curl -X POST https://api.github.com/repos/${repoFullName}/dispatches \\
-          -H "Accept: application/vnd.github.v3+json" \\
-          -H "Authorization: token \${{ secrets.GH_TOKEN }}" \\
-          -d '{"event_type": "create-vps", "client_payload": {"vps_name": "autovps", "backup": false}}'
-`;
-}
-
-export default async (req, res) => {
-  // CORS headers
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
-  try {
-    const origin = req.headers.origin;
-
-    if (!checkOrigin(origin)) {
-      return res.status(403).json({ 
-        error: 'Unauthorized origin', 
-        origin 
-      });
-    }
-    const { github_token } = req.body;
-
-    if (!github_token) {
-      return res.status(400).json({ error: 'Missing github_token' });
-    }
-    // Validate GitHub token format
-    if (!github_token.startsWith('ghp_') && !github_token.startsWith('github_pat_')) {
-      return res.status(400).json({ error: 'Invalid GitHub token format' });
-    }
-    // Initialize Octokit
-    const octokit = new Octokit({ auth: github_token });
-
-    // Test GitHub connection
-    const { data: user } = await octokit.rest.users.getAuthenticated();
-    console.log(`Connected to GitHub for user: ${user.login}`);
-    // Create repository
-    const repoName = `vps-project-${Date.now()}`;
-    const { data: repo } = await octokit.rest.repos.createForAuthenticatedUser({
-      name: repoName,
-      private: false,
-      auto_init: true,
-      description: 'VPS Manager - Created by Hiếu Dz'
-    });
-    const repoFullName = repo.full_name;
-    const ngrokServerUrl = `https://${req.headers.host}`;
-    // Wait for initial commit to complete
-    console.log('Waiting for repository initialization...');
-    await new Promise(resolve => setTimeout(resolve, 3000));
-
-    // Create repo secret
-    await createRepoSecret(octokit, user.login, repoName, 'GH_TOKEN', github_token);
-
-    // Create workflow files
-    const files = {
-      '.github/workflows/tmate.yml': {
-        content: generateTmateYml(ngrokServerUrl, repoName, repoFullName),
-        message: 'Add VPS workflow'
-      },
-      'auto-start.yml': {
-        content: generateAutoStartYml(repoFullName),
-        message: 'Add auto-start configuration'
-      },
-      'README.md': {
-        content: `# VPS Project - ${repoName}
-## 🖥️ VPS Information
-- **OS**: Windows Server (Latest)
-- **Access**: noVNC Web Interface via Browser
-- **Password**: hieudz
-- **Runtime**: ~5.5 hours with auto-restart
-## 📋 Files
-- .github/workflows/tmate.yml: Main VPS workflow
-- auto-start.yml: Auto-start configuration  
-- remote-link.txt: Generated VPS access URL (check this file for the link)
-## 🚀 Usage
-1. The workflow runs automatically after creation
-2. Wait 5-10 minutes for setup completion
-3. Check remote-link.txt file for your VPS access URL
-4. Open the URL in browser and use password: **hieudz**
-## ⚡ Features
-- Automatic restart on failure
-- Windows Server with GUI
-- noVNC web-based access
-- Cloudflare tunnel for public access
----
-*Generated by VPS Manager - hieuvn.xyz*
-`,
-        message: 'Update README with VPS info'
-      }
-    };
-    // Create files in repository with error handling
-    for (const [path, { content, message }] of Object.entries(files)) {
-      try {
-        await createOrUpdateFile(octokit, user.login, repoName, path, content, message);
-        // Small delay between file operations
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      } catch (error) {
-        console.error(`Failed to create ${path}:`, error.message);
-        // Continue with other files even if one fails
-      }
-    }
-    // Wait for files to be committed
-    console.log('Waiting for files to be committed...');
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    // Trigger workflow
-    try {
-      await octokit.rest.repos.createDispatchEvent({
-        owner: user.login,
-        repo: repoName,
-        event_type: 'create-vps',
-        client_payload: {
-          vps_name: 'initial-vps',
-          backup: true,
-          created_by: 'hieudz-vps-manager'
-        }
-      });
-      console.log(`Workflow triggered for repository: ${repoFullName}`);
-    } catch (error) {
-      console.error('Error triggering workflow:', error.message);
-      // Don't fail the entire request if workflow trigger fails
-    }
-    // Return immediate response, let client poll for remote-link.txt
-    return res.status(200).json({
-      status: 'success',
-      message: 'VPS creation initiated successfully',
-      repository: repoFullName,
-      workflow_status: 'triggered',
-      estimated_ready_time: '5-10 minutes',
-      instructions: 'Poll the remote-link.txt file in your repository for the VPS access URL'
-    });
-  } catch (error) {
-    console.error('Error creating VPS:', error);
-
-    if (error.status === 401) {
-      return res.status(401).json({ 
-        error: 'Invalid GitHub token. Please check your token permissions.',
-        details: error.message 
-      });
-    }
-
-    return res.status(500).json({ 
-      error: 'Failed to create VPS',
-      details: error.message 
-    });
-  }
-};
